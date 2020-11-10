@@ -20,6 +20,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
+	"strings"
+	"time"
 
 	operatorv1alpha1 "github.com/font/gatekeeper-operator/api/v1alpha1"
 	"github.com/font/gatekeeper-operator/controllers/merge"
@@ -29,6 +32,7 @@ import (
 	"github.com/pkg/errors"
 	admregv1 "k8s.io/api/admissionregistration/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -66,7 +70,15 @@ var (
 )
 
 const (
-	gatekeeperFinalizer = "finalizer.operator.gatekeeper.sh"
+	gatekeeperFinalizer         = "finalizer.operator.gatekeeper.sh"
+	managerContainer            = "manager"
+	logLevelArg                 = "--log-level"
+	auditIntervalArg            = "--audit-interval"
+	constraintViolationLimitArg = "--constraint-violations-limit"
+	auditFromCacheArg           = "--audit-from-cache"
+	auditChunkSizeArg           = "--audit-chunk-size"
+	emitAuditEventsArg          = "--emit-audit-events"
+	emitAdmissionEventsArg      = "--emit-admission-events"
 )
 
 // GatekeeperReconciler reconciles a Gatekeeper object
@@ -349,6 +361,24 @@ func auditOverrides(obj *unstructured.Unstructured, audit *operatorv1alpha1.Audi
 		if err := setReplicas(obj, audit.Replicas); err != nil {
 			return err
 		}
+		if err := setLogLevel(obj, audit.LogLevel); err != nil {
+			return err
+		}
+		if err := setAuditInterval(obj, audit.AuditInterval); err != nil {
+			return err
+		}
+		if err := setConstraintViolationLimit(obj, audit.ConstraintViolationLimit); err != nil {
+			return err
+		}
+		if err := setAuditFromCache(obj, audit.AuditFromCache); err != nil {
+			return err
+		}
+		if err := setAuditChunkSize(obj, audit.AuditChunkSize); err != nil {
+			return err
+		}
+		if err := setEmitEvents(obj, emitAuditEventsArg, audit.EmitAuditEvents); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -356,6 +386,12 @@ func auditOverrides(obj *unstructured.Unstructured, audit *operatorv1alpha1.Audi
 func webhookOverrides(obj *unstructured.Unstructured, webhook *operatorv1alpha1.WebhookConfig) error {
 	if webhook != nil {
 		if err := setReplicas(obj, webhook.Replicas); err != nil {
+			return err
+		}
+		if err := setLogLevel(obj, webhook.LogLevel); err != nil {
+			return err
+		}
+		if err := setEmitEvents(obj, emitAdmissionEventsArg, webhook.EmitAdmissionEvents); err != nil {
 			return err
 		}
 	}
@@ -396,6 +432,56 @@ func setReplicas(obj *unstructured.Unstructured, replicas *int64) error {
 		if err := unstructured.SetNestedField(obj.Object, *replicas, "spec", "replicas"); err != nil {
 			return errors.Wrapf(err, "Failed to set replica value")
 		}
+	}
+	return nil
+}
+
+func setLogLevel(obj *unstructured.Unstructured, logLevel *operatorv1alpha1.LogLevelMode) error {
+	if logLevel != nil {
+		return setContainerArg(obj, managerContainer, logLevelArg, string(*logLevel))
+	}
+	return nil
+}
+
+func setAuditInterval(obj *unstructured.Unstructured, auditInterval *metav1.Duration) error {
+	if auditInterval != nil {
+		return setContainerArg(obj, managerContainer, auditIntervalArg, fmt.Sprint(auditInterval.Round(time.Second).Seconds()))
+	}
+	return nil
+}
+
+func setConstraintViolationLimit(obj *unstructured.Unstructured, constraintViolationLimit *int64) error {
+	if constraintViolationLimit != nil {
+		return setContainerArg(obj, managerContainer, constraintViolationLimitArg, strconv.FormatInt(*constraintViolationLimit, 10))
+	}
+	return nil
+}
+
+func setAuditFromCache(obj *unstructured.Unstructured, auditFromCache *operatorv1alpha1.AuditFromCacheMode) error {
+	if auditFromCache != nil {
+		auditFromCacheValue := "false"
+		if *auditFromCache == operatorv1alpha1.AuditFromCacheEnabled {
+			auditFromCacheValue = "true"
+		}
+		return setContainerArg(obj, managerContainer, auditFromCacheArg, auditFromCacheValue)
+	}
+	return nil
+}
+
+func setAuditChunkSize(obj *unstructured.Unstructured, auditChunkSize *int64) error {
+	if auditChunkSize != nil {
+		return setContainerArg(obj, managerContainer, auditChunkSizeArg, strconv.FormatInt(*auditChunkSize, 10))
+	}
+	return nil
+}
+
+func setEmitEvents(obj *unstructured.Unstructured, argName string, emitEvents *operatorv1alpha1.EmitEventsMode) error {
+	if emitEvents != nil {
+		emitArgValue := "false"
+		if *emitEvents == operatorv1alpha1.EmitEventsEnabled {
+			emitArgValue = "true"
+		}
+		return setContainerArg(obj, managerContainer, argName, emitArgValue)
 	}
 	return nil
 }
@@ -489,10 +575,64 @@ func setImage(container map[string]interface{}, spec operatorv1alpha1.Gatekeeper
 	return nil
 }
 
+func setContainerAttrWithFn(obj *unstructured.Unstructured, containerName string, containerFn func(map[string]interface{}) error) error {
+	containers, found, err := unstructured.NestedSlice(obj.Object, "spec", "template", "spec", "containers")
+	if err != nil || !found {
+		return errors.Wrapf(err, "Failed to retrieve containers")
+	}
+	for _, c := range containers {
+		container := c.(map[string]interface{})
+		if name, found, err := unstructured.NestedString(container, "name"); err != nil || !found {
+			return errors.Wrapf(err, "Unable to retrieve container: %s", name)
+		} else if name == containerName {
+			if err := containerFn(container); err != nil {
+				return err
+			}
+		}
+	}
+	if err := unstructured.SetNestedSlice(obj.Object, containers, "spec", "template", "spec", "containers"); err != nil {
+		return errors.Wrapf(err, "Failed to set containers")
+	}
+	return nil
+}
+
+func setContainerArg(obj *unstructured.Unstructured, containerName, argName string, argValue string) error {
+	return setContainerAttrWithFn(obj, managerContainer, func(container map[string]interface{}) error {
+		args, found, err := unstructured.NestedStringSlice(container, "args")
+		if !found || err != nil {
+			return errors.Wrapf(err, "Unable to retrieve container arguments for: %s", containerName)
+		}
+		exists := false
+		for i, arg := range args {
+			n, _ := fromArg(arg)
+			if n == argName {
+				args[i] = toArg(argName, argValue)
+				exists = true
+			}
+		}
+		if !exists {
+			args = append(args, toArg(argName, argValue))
+		}
+		return unstructured.SetNestedStringSlice(container, args, "args")
+	})
+}
+
 // toMap Convenience method to convert any struct into a map
 func toMap(obj interface{}) map[string]interface{} {
 	var result map[string]interface{}
 	resultRec, _ := json.Marshal(obj)
 	json.Unmarshal(resultRec, &result)
 	return result
+}
+
+func toArg(name, value string) string {
+	return name + "=" + value
+}
+
+func fromArg(arg string) (key, value string) {
+	parts := strings.Split(arg, "=")
+	if len(parts) == 1 {
+		return parts[0], ""
+	}
+	return parts[0], parts[1]
 }
